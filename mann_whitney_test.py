@@ -1,7 +1,7 @@
 import warnings
 import numpy as np
 from scipy import stats
-from typing import Tuple, Union, List
+from typing import Tuple, Union, List, Optional
 
 
 class MannWhitneyUTest:
@@ -152,6 +152,209 @@ class MannWhitneyUTest:
         return u_val / n_a + (n_a + 1) / 2.0
 
 
+class WilcoxonSignedRankTest:
+    def __init__(self, alternative: str = "two-sided", zero_method: str = "wilcox"):
+        if alternative not in ("two-sided", "less", "greater"):
+            raise ValueError(
+                "alternative must be 'two-sided', 'less', or 'greater'"
+            )
+        if zero_method not in ("wilcox", "pratt", "zsplit"):
+            raise ValueError(
+                "zero_method must be 'wilcox', 'pratt', or 'zsplit'"
+            )
+        self.alternative = alternative
+        self.zero_method = zero_method
+
+    @staticmethod
+    def _choose_method(n: int, has_ties: bool) -> str:
+        if n <= 50 and not has_ties:
+            return "exact"
+        return "asymptotic"
+
+    def test(
+        self,
+        sample1: Union[List[float], np.ndarray],
+        sample2: Union[List[float], np.ndarray],
+        method: str = "auto",
+    ) -> Tuple[float, float, dict]:
+        if method not in ("auto", "exact", "asymptotic"):
+            raise ValueError("method must be 'auto', 'exact', or 'asymptotic'")
+
+        x = np.asarray(sample1, dtype=np.float64)
+        y = np.asarray(sample2, dtype=np.float64)
+
+        if x.ndim != 1 or y.ndim != 1:
+            raise ValueError("samples must be 1-D arrays")
+        if x.size != y.size:
+            raise ValueError("paired samples must have the same length")
+        if x.size < 6:
+            raise ValueError("sample size must be at least 6")
+        if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+            raise ValueError("samples must not contain NaN or infinite values")
+
+        diff = x - y
+        nonzero = diff[diff != 0]
+        n_nonzero = nonzero.size
+        has_ties = len(np.unique(np.abs(nonzero))) < n_nonzero
+
+        if method == "auto":
+            resolved_method = self._choose_method(n_nonzero, has_ties)
+        else:
+            resolved_method = method
+
+        if resolved_method == "exact" and has_ties:
+            warnings.warn(
+                "Exact p-value may be unreliable when there are ties in the "
+                "absolute differences. Consider using method='asymptotic' or "
+                "use the 'pratt' zero_method.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        try:
+            result = stats.wilcoxon(
+                x,
+                y,
+                alternative=self.alternative,
+                zero_method=self.zero_method,
+                method=resolved_method if resolved_method != "asymptotic" else "approx",
+            )
+        except ValueError:
+            result = stats.wilcoxon(
+                x,
+                y,
+                alternative=self.alternative,
+                zero_method=self.zero_method,
+                method="approx",
+            )
+            resolved_method = "asymptotic"
+
+        w_statistic = float(result.statistic)
+        p_value = float(result.pvalue)
+
+        median_diff = float(np.median(diff))
+        n_pairs = x.size
+        n_zeros = int(np.sum(diff == 0))
+        n_positive = int(np.sum(diff > 0))
+        n_negative = int(np.sum(diff < 0))
+
+        if self.alternative == "two-sided":
+            conclusion = (
+                "Reject H0: paired samples have significantly different distributions"
+                if p_value < 0.05
+                else "Fail to reject H0: no significant difference"
+            )
+        elif self.alternative == "less":
+            conclusion = (
+                "Reject H0: sample1 distribution is significantly less than sample2"
+                if p_value < 0.05
+                else "Fail to reject H0"
+            )
+        else:
+            conclusion = (
+                "Reject H0: sample1 distribution is significantly greater than sample2"
+                if p_value < 0.05
+                else "Fail to reject H0"
+            )
+
+        info = {
+            "n_pairs": n_pairs,
+            "n_nonzero": n_nonzero,
+            "n_zeros": n_zeros,
+            "n_positive": n_positive,
+            "n_negative": n_negative,
+            "median_difference": median_diff,
+            "mean_difference": float(np.mean(diff)),
+            "zero_method": self.zero_method,
+            "alternative": self.alternative,
+            "method": resolved_method,
+            "significance_level": 0.05,
+            "conclusion": conclusion,
+        }
+
+        return w_statistic, p_value, info
+
+
+class KruskalWallisTest:
+    def __init__(self, nan_policy: str = "raise"):
+        if nan_policy not in ("propagate", "raise", "omit"):
+            raise ValueError(
+                "nan_policy must be 'propagate', 'raise', or 'omit'"
+            )
+        self.nan_policy = nan_policy
+
+    def _validate_samples(self, samples: List[np.ndarray]):
+        if len(samples) < 2:
+            raise ValueError("at least 2 groups are required")
+        for i, s in enumerate(samples):
+            if s.ndim != 1:
+                raise ValueError(f"sample {i+1} must be a 1-D array")
+            if s.size < 1:
+                raise ValueError(f"sample {i+1} must not be empty")
+
+    def test(
+        self,
+        *samples: Union[List[float], np.ndarray],
+    ) -> Tuple[float, float, dict]:
+        arr_list = [np.asarray(s, dtype=np.float64) for s in samples]
+        self._validate_samples(arr_list)
+
+        result = stats.kruskal(
+            *arr_list,
+            nan_policy=self.nan_policy,
+        )
+
+        h_statistic = float(result.statistic)
+        p_value = float(result.pvalue)
+
+        k = len(arr_list)
+        n_total = sum(arr.size for arr in arr_list)
+        group_sizes = [arr.size for arr in arr_list]
+        group_medians = [float(np.median(arr)) for arr in arr_list]
+
+        all_data = np.concatenate(arr_list)
+        ranks = stats.rankdata(all_data)
+        group_ranks = []
+        start = 0
+        for size in group_sizes:
+            group_ranks.append(float(np.mean(ranks[start:start + size])))
+            start += size
+
+        has_ties = len(np.unique(all_data)) < n_total
+
+        h_adj = None
+        if has_ties and n_total > 0:
+            tied_values, counts = np.unique(all_data, return_counts=True)
+            tie_correction = 1 - np.sum(counts**3 - counts) / (n_total**3 - n_total)
+            if tie_correction > 0:
+                h_adj = h_statistic / tie_correction
+
+        df = k - 1
+
+        conclusion = (
+            "Reject H0: at least one group has a significantly different distribution"
+            if p_value < 0.05
+            else "Fail to reject H0: no significant difference among groups"
+        )
+
+        info = {
+            "k_groups": k,
+            "n_total": n_total,
+            "group_sizes": group_sizes,
+            "group_medians": group_medians,
+            "group_mean_ranks": group_ranks,
+            "degrees_of_freedom": df,
+            "has_ties": has_ties,
+            "h_corrected": h_adj,
+            "tie_correction_applied": h_adj is not None,
+            "nan_policy": self.nan_policy,
+            "significance_level": 0.05,
+            "conclusion": conclusion,
+        }
+
+        return h_statistic, p_value, info
+
+
 def mann_whitney_u_test(
     sample1: Union[List[float], np.ndarray],
     sample2: Union[List[float], np.ndarray],
@@ -165,81 +368,99 @@ def mann_whitney_u_test(
     return tester.test(sample1, sample2, method=method)
 
 
+def wilcoxon_signed_rank_test(
+    sample1: Union[List[float], np.ndarray],
+    sample2: Union[List[float], np.ndarray],
+    alternative: str = "two-sided",
+    zero_method: str = "wilcox",
+    method: str = "auto",
+) -> Tuple[float, float, dict]:
+    tester = WilcoxonSignedRankTest(
+        alternative=alternative, zero_method=zero_method
+    )
+    return tester.test(sample1, sample2, method=method)
+
+
+def kruskal_wallis_test(
+    *samples: Union[List[float], np.ndarray],
+    nan_policy: str = "raise",
+) -> Tuple[float, float, dict]:
+    tester = KruskalWallisTest(nan_policy=nan_policy)
+    return tester.test(*samples)
+
+
 if __name__ == "__main__":
     np.random.seed(42)
 
     print("=" * 70)
-    print("场景1: 样本量相近 (30 vs 25) — 渐近法通常可靠")
+    print("【一】Mann-Whitney U 检验 (两独立样本)")
     print("=" * 70)
     sample_a = np.random.exponential(scale=2.0, size=30)
     sample_b = np.random.exponential(scale=3.0, size=25)
 
-    u, p, info = mann_whitney_u_test(
-        sample_a, sample_b, method="auto"
-    )
-    print(f"  样本量: n1={info['n1']}, n2={info['n2']}, 比值={max(info['n1'],info['n2'])/min(info['n1'],info['n2']):.1f}")
-    print(f"  自动选择方法: {info['method']}")
+    u, p, info = mann_whitney_u_test(sample_a, sample_b, method="auto")
+    print(f"  样本量: n1={info['n1']}, n2={info['n2']}")
+    print(f"  方法: {info['method']}")
     print(f"  U 统计量: {u:.4f}")
     print(f"  p 值: {p:.6f}")
     print(f"  结论: {info['conclusion']}")
 
     print("\n" + "=" * 70)
-    print("场景2: 样本量差异过大 (5 vs 200) — 渐近法 p 值不准确 (Bug 演示)")
+    print("【二】Wilcoxon 符号秩检验 (配对样本)")
     print("=" * 70)
-    small = [1.2, 2.5, 3.1, 1.8, 2.2]
-    large = np.random.exponential(scale=2.0, size=200).tolist()
+    n_pairs = 30
+    pre = np.random.exponential(scale=2.5, size=n_pairs)
+    post = pre + np.random.normal(loc=-0.5, scale=1.0, size=n_pairs)
 
-    print("\n  [渐近法 - 存在偏差]")
-    u_asymp, p_asymp, info_asymp = mann_whitney_u_test(
-        small, large, method="asymptotic"
-    )
-    print(f"  U 统计量: {u_asymp:.4f}")
-    print(f"  p 值 (渐近): {p_asymp:.6f}")
+    w, p_w, info_w = wilcoxon_signed_rank_test(pre, post, method="auto")
+    print(f"  配对数: {info_w['n_pairs']} (非零差: {info_w['n_nonzero']})")
+    print(f"  正差数: {info_w['n_positive']}, 负差数: {info_w['n_negative']}")
+    print(f"  方法: {info_w['method']}")
+    print(f"  W 统计量: {w:.4f}")
+    print(f"  p 值: {p_w:.6f}")
+    print(f"  中位数差 (前-后): {info_w['median_difference']:.4f}")
+    print(f"  结论: {info_w['conclusion']}")
 
-    print("\n  [精确法 - 准确结果]")
-    u_exact, p_exact, info_exact = mann_whitney_u_test(
-        small, large, method="exact"
+    print("\n  --- 单侧检验: post < pre (降低) ---")
+    w_less, p_less, info_less = wilcoxon_signed_rank_test(
+        pre, post, alternative="greater", method="auto"
     )
-    print(f"  U 统计量: {u_exact:.4f}")
-    print(f"  p 值 (精确): {p_exact:.6f}")
-    print(f"  p 值差异: {abs(p_asymp - p_exact):.6f}")
-    if abs(p_asymp - p_exact) > 0.01:
-        print(f"  ⚠ 渐近法与精确法 p 值差异超过 0.01，渐近法不可靠！")
-
-    print("\n  [自动模式 - 智能选择]")
-    u_auto, p_auto, info_auto = mann_whitney_u_test(
-        small, large, method="auto"
-    )
-    print(f"  自动选择方法: {info_auto['method']}")
-    print(f"  U 统计量: {u_auto:.4f}")
-    print(f"  p 值: {p_auto:.6f}")
+    print(f"  W 统计量: {w_less:.4f}")
+    print(f"  p 值 (单侧 greater): {p_less:.6f}")
+    print(f"  结论: {info_less['conclusion']}")
 
     print("\n" + "=" * 70)
-    print("场景3: 样本量差异过大 (8 vs 100) — 自动模式警告演示")
+    print("【三】Kruskal-Wallis H 检验 (多组独立样本)")
     print("=" * 70)
-    med = np.random.exponential(scale=2.0, size=8).tolist()
-    huge = np.random.exponential(scale=2.0, size=100).tolist()
+    group1 = np.random.exponential(scale=2.0, size=20)
+    group2 = np.random.exponential(scale=3.0, size=25)
+    group3 = np.random.exponential(scale=2.5, size=22)
 
-    u_auto2, p_auto2, info_auto2 = mann_whitney_u_test(
-        med, huge, method="auto"
-    )
-    print(f"  样本量: n1=8, n2=100, 比值=12.5")
-    print(f"  自动选择方法: {info_auto2['method']}")
-    print(f"  U 统计量: {u_auto2:.4f}")
-    print(f"  p 值: {p_auto2:.6f}")
+    h, p_h, info_h = kruskal_wallis_test(group1, group2, group3)
+    print(f"  组数: {info_h['k_groups']}, 总样本: {info_h['n_total']}")
+    print(f"  各组样本量: {info_h['group_sizes']}")
+    print(f"  各组中位数: {[round(m, 4) for m in info_h['group_medians']]}")
+    print(f"  各组平均秩: {[round(r, 4) for r in info_h['group_mean_ranks']]}")
+    print(f"  自由度: {info_h['degrees_of_freedom']}")
+    print(f"  是否有结点: {info_h['has_ties']}")
+    print(f"  H 统计量: {h:.4f}")
+    if info_h['h_corrected'] is not None:
+        print(f"  H (校正后): {info_h['h_corrected']:.4f}")
+    print(f"  p 值: {p_h:.6f}")
+    print(f"  结论: {info_h['conclusion']}")
+
+    print("\n  --- 两组对比 (等价于 Mann-Whitney U 双侧检验) ---")
+    h2, p2, info2 = kruskal_wallis_test(group1, group2)
+    print(f"  两组比较 H 统计量: {h2:.4f}")
+    print(f"  两组比较 p 值: {p2:.6f}")
+    print(f"  自由度: {info2['degrees_of_freedom']}")
 
     print("\n" + "=" * 70)
-    print("场景4: 强制渐近法 + 大比值 — 触发用户警告")
+    print("【四】三种检验关系总结")
     print("=" * 70)
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        u_warn, p_warn, info_warn = mann_whitney_u_test(
-            med, huge, method="asymptotic"
-        )
-        print(f"  U 统计量: {u_warn:.4f}")
-        print(f"  p 值 (渐近): {p_warn:.6f}")
-        if w:
-            print(f"  ⚠ 警告: {w[0].message}")
-        if "p_value_exact" in info_warn:
-            print(f"  p 值 (精确参考): {info_warn['p_value_exact']:.6f}")
-            print(f"  p 值差异: {info_warn['p_value_diff']:.6f}")
+    print("  场景                    | 推荐检验方法")
+    print("  ------------------------|---------------------------")
+    print("  两独立样本              | Mann-Whitney U 检验")
+    print("  两配对/相关样本         | Wilcoxon 符号秩检验")
+    print("  三组及以上独立样本      | Kruskal-Wallis H 检验")
+    print("  (Kruskal-Wallis 两组时 ≈ Mann-Whitney U 双侧)")
